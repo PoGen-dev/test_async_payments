@@ -1,0 +1,103 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [backend]
+
+  rabbitmq:
+    build:
+      context: .
+      dockerfile: Dockerfile.rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-payments}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_port_listener 5672 && rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    networks: [backend]
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: &service_env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-payments}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+      WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:?Set WEBHOOK_SIGNING_SECRET in .env}
+      ENABLE_DOCS: ${ENABLE_DOCS:-false}
+      WEBHOOK_ALLOW_PRIVATE: ${WEBHOOK_ALLOW_PRIVATE:-false}
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+    networks: [backend]
+
+  api:
+    build: .
+    environment: *service_env
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8080}:8000"
+    expose: ["9200"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/health/live', headers={'X-API-Key': os.environ['API_KEY']}), timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    stop_grace_period: 45s
+    networks: [backend]
+
+  consumer:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    expose: ["9100"]
+    environment: *service_env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    stop_grace_period: 45s
+    networks: [backend]
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      <<: *service_env
+      TEST_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-payments}
+      TEST_RABBITMQ_URL: amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+    networks: [backend]
+
+networks:
+  backend:
+
+volumes:
+  pgdata:
+  rabbitdata:
